@@ -1,6 +1,6 @@
 import logging
 
-from klippy.extras import bus
+from . import bus
 
 REPORT_TIME = 0.1
 BMP388_CHIP_ADDR = 0x77
@@ -10,6 +10,9 @@ BMP388_REGS = {
     "CMD": 0x7E,
     "STATUS": 0x03,
     "PWR_CTRL": 0x1B,
+    "OSR": 0x1C,
+    "ORD": 0x1D,
+    "INT_CTRL": 0x19,
     "CAL_1": 0x31,
     "TEMP_MSB": 0x09,
     "TEMP_LSB": 0x08,
@@ -22,6 +25,10 @@ BMP388_CHIP_ID = 0x50
 BMP388_REG_VAL_STATUS_CMD_READY = 1 << 4
 BMP388_REG_VAL_PRESS_EN = 0x01
 BMP388_REG_VAL_TEMP_EN = 0x02
+BMP388_REG_VAL_PRESS_OS_NO = 0b000
+BMP388_REG_VAL_TEMP_OS_NO = 0b000000
+BMP388_REG_VAL_ODR_50_HZ = 0x02
+BMP388_REG_VAL_DRDY_EN = 0b100000
 BMP388_REG_VAL_NORMAL_MODE = 0x30
 BMP388_REG_VAL_RESET_CHIP_VALUE = 0xB6
 
@@ -81,21 +88,21 @@ class BMP388:
 
     def _load_calibration_data(self, calibration_data_1):
         dig = {}
-        dig["T1"] = get_unsigned_short(calibration_data_1[0:2])
-        dig["T2"] = get_unsigned_short(calibration_data_1[2:4])
-        dig["T3"] = get_signed_byte(calibration_data_1[4])
+        dig["T1"] = get_unsigned_short(calibration_data_1[0:2]) / 0.00390625
+        dig["T2"] = get_unsigned_short(calibration_data_1[2:4]) / 1073741824.0
+        dig["T3"] = get_signed_byte(calibration_data_1[4]) / 281474976710656.0
 
-        dig["P1"] = get_signed_short(calibration_data_1[5:7])
-        dig["P2"] = get_signed_short(calibration_data_1[7:9])
-        dig["P3"] = get_signed_byte(calibration_data_1[9])
-        dig["P4"] = get_signed_byte(calibration_data_1[10])
-        dig["P5"] = get_unsigned_short(calibration_data_1[11:13])
-        dig["P6"] = get_unsigned_short(calibration_data_1[13:15])
-        dig["P7"] = get_signed_byte(calibration_data_1[15])
-        dig["P8"] = get_signed_byte(calibration_data_1[16])
-        dig["P9"] = get_signed_short(calibration_data_1[17:19])
-        dig["P10"] = get_signed_byte(calibration_data_1[19])
-        dig["P11"] = get_signed_byte(calibration_data_1[20])
+        dig["P1"] = (get_signed_short(calibration_data_1[5:7]) - 16384) / 1048576.0
+        dig["P2"] = (get_signed_short(calibration_data_1[7:9]) - 16384) / 536870912.0
+        dig["P3"] = get_signed_byte(calibration_data_1[9]) / 4294967296.0
+        dig["P4"] = get_signed_byte(calibration_data_1[10]) / 137438953472.0
+        dig["P5"] = get_unsigned_short(calibration_data_1[11:13]) / 0.125
+        dig["P6"] = get_unsigned_short(calibration_data_1[13:15]) / 64.0
+        dig["P7"] = get_signed_byte(calibration_data_1[15]) / 256.0
+        dig["P8"] = get_signed_byte(calibration_data_1[16]) / 32768.0
+        dig["P9"] = get_signed_short(calibration_data_1[17:19]) / 281474976710656.0
+        dig["P10"] = get_signed_byte(calibration_data_1[19]) / 281474976710656.0
+        dig["P11"] = get_signed_byte(calibration_data_1[20]) / 36893488147419103232.0
         return dig
 
     def _init(self):
@@ -120,19 +127,31 @@ class BMP388:
                 | BMP388_REG_VAL_NORMAL_MODE
             ],
         )
+        self.write_register(
+            "OSR", [BMP388_REG_VAL_PRESS_OS_NO | BMP388_REG_VAL_TEMP_OS_NO]
+        )
+        self.write_register("ORD", [BMP388_REG_VAL_ODR_50_HZ])
+        self.write_register("INT_CTRL", [BMP388_REG_VAL_DRDY_EN])
         cal_1 = self.read_register("CAL_1", 21)
         self.dig = self._load_calibration_data(cal_1)
         self.max_sample_time = 0.5
         self.sample_timer = self.reactor.register_timer(self._sample)
 
     def _sample(self, eventtime):
-        self.temp = self._sample_temperature() / 100.0
-        self.pressure = self._sample_pressure() / 100.0
-        if self.temp < self.min_temp or self.temp > self.max_temp:
-            self.printer.invoke_shutdown(
-                "BMP388 temperature %0.1f outside range of %0.1f:%.01f"
-                % (self.temp, self.min_temp, self.max_temp)
-            )
+        status = self.read_register("STATUS", 1)
+        if status[0] & 0b100000:
+            self.temp = self._sample_temperature()
+            if self.temp < self.min_temp or self.temp > self.max_temp:
+                self.printer.invoke_shutdown(
+                    "BMP388 temperature %0.1f outside range of %0.1f:%.01f"
+                    % (self.temp, self.min_temp, self.max_temp)
+                )
+            # logging.info("BMP388: Temperature: %0.2f" % self.temp)
+
+        if status[0] & 0b010000:
+            self.pressure = self._sample_pressure()
+            # logging.info("BMP388: Pressure: %0.2f" % self.pressure)
+
         measured_time = self.reactor.monotonic()
         self._callback(self.mcu.estimated_print_time(measured_time), self.temp)
         return measured_time + REPORT_TIME
@@ -145,15 +164,18 @@ class BMP388:
         return self._compensate_temperature(adc_T)
 
     def _compensate_temperature(self, adc_T):
-        partial_data1 = adc_T - (256 * (self.dig["T1"]))
+        partial_data1 = adc_T - self.dig["T1"]
         partial_data2 = self.dig["T2"] * partial_data1
-        partial_data3 = partial_data1 * partial_data1
-        partial_data4 = (partial_data3) * (self.dig["T3"])
-        partial_data5 = ((partial_data2) * 262144) + partial_data4
-        partial_data6 = (partial_data5) / 4294967296
-        self.t_fine = partial_data6
-        comp_temp = (partial_data6 * 25) / 16384
-        return comp_temp
+
+        self.t_fine = partial_data2 + (partial_data1 * partial_data1) * self.dig["T3"]
+
+        if self.t_fine < -40.0:
+            self.t_fine = -40.0
+
+        if self.t_fine > 85.0:
+            self.t_fine = 85.0
+
+        return self.t_fine
 
     def _sample_pressure(self):
         xlsb = self.read_register("PRESS_XLSB", 1)
@@ -163,39 +185,31 @@ class BMP388:
         return self._compensate_pressure(adc_P)
 
     def _compensate_pressure(self, adc_P):
-        partial_data1 = self.t_fine * self.t_fine
-        partial_data2 = partial_data1 / 64
-        partial_data3 = (partial_data2 * self.t_fine) / 256
-        partial_data4 = (self.dig["P8"] * partial_data3) / 32
-        partial_data5 = (self.dig["P7"] * partial_data1) * 16
-        partial_data6 = (self.dig["P6"] * self.t_fine) * 4194304
-        offset = (
-            ((self.dig["P5"]) * 140737488355328)
-            + partial_data4
-            + partial_data5
-            + partial_data6
+        partial_data1 = self.dig["P6"] * self.t_fine
+        partial_data2 = self.dig["P7"] * (self.t_fine * self.t_fine)
+        partial_data3 = self.dig["P8"] * (self.t_fine * self.t_fine * self.t_fine)
+        partial_out1 = self.dig["P5"] + partial_data1 + partial_data2 + partial_data3
+
+        partial_data1 = self.dig["P2"] * self.t_fine
+        partial_data2 = self.dig["P3"] * (self.t_fine * self.t_fine)
+        partial_data3 = self.dig["P4"] * (self.t_fine * self.t_fine * self.t_fine)
+        partial_out2 = adc_P * (
+            self.dig["P1"] + partial_data1 + partial_data2 + partial_data3
         )
 
-        partial_data2 = ((self.dig["P4"]) * partial_data3) / 32
-        partial_data4 = (self.dig["P3"] * partial_data1) * 4
-        partial_data5 = ((self.dig["P2"]) - 16384) * (self.t_fine) * 2097152
-        sensitivity = (
-            (((self.dig["P1"]) - 16384) * 70368744177664)
-            + partial_data2
-            + partial_data4
-            + partial_data5
-        )
+        partial_data1 = adc_P * adc_P
+        partial_data2 = self.dig["P9"] + (self.dig["P10"] * self.t_fine)
+        partial_data3 = partial_data1 * partial_data2
+        partial_data4 = partial_data3 + adc_P * adc_P * adc_P * self.dig["P11"]
 
-        partial_data1 = (sensitivity / 16777216) * adc_P
-        partial_data2 = (self.dig["P10"]) * (self.t_fine)
-        partial_data3 = partial_data2 + (65536 * (self.dig["P9"]))
-        partial_data4 = (partial_data3 * adc_P) / 8192
-        partial_data5 = (partial_data4 * adc_P) / 512
-        partial_data6 = adc_P * adc_P
-        partial_data2 = ((self.dig["P11"]) * (partial_data6)) / 65536
-        partial_data3 = (partial_data2 * adc_P) / 128
-        partial_data4 = (offset / 4) + partial_data1 + partial_data5 + partial_data3
-        comp_press = (partial_data4 * 25) / 1099511627776
+        comp_press = partial_out1 + partial_out2 + partial_data4
+
+        if comp_press < 30000:
+            comp_press = 30000
+
+        if comp_press > 125000:
+            comp_press = 125000
+
         return comp_press
 
     def read_id(self):
