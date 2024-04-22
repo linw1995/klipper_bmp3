@@ -23,3 +23,11 @@ sensor_type: BMP388 # Custom Plugin
 i2c_software_scl_pin: PA8
 i2c_software_sda_pin: PC9
 ```
+
+## mainsail display
+
+only support the below sensors to display pressure.
+
+```ts
+export const additionalSensors = ['bme280', 'aht10', 'htu21d']
+```

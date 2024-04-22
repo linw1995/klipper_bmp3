@@ -149,7 +149,7 @@ class BMP388:
             # logging.info("BMP388: Temperature: %0.2f" % self.temp)
 
         if status[0] & 0b010000:
-            self.pressure = self._sample_pressure()
+            self.pressure = self._sample_pressure() / 100.0
             # logging.info("BMP388: Pressure: %0.2f" % self.pressure)
 
         measured_time = self.reactor.monotonic()
